@@ -16,6 +16,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 
 import config as cfg
@@ -79,14 +80,29 @@ class HuYaAuto:
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         chrome_options.add_argument('--window-size=1920,1080')
+        # 直播间页面资源重、默认 normal 策略会死等整页加载完导致 WebDriver 读超时；eager 只等 DOM 就绪
+        chrome_options.page_load_strategy = 'eager'
 
         print("[START] 启动浏览器")
         driver = webdriver.Chrome(
             service=Service(ChromeDriverManager().install()),
             options=chrome_options
         )
+        driver.set_page_load_timeout(30)
+        driver.set_script_timeout(30)
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         return driver
+
+    def _safe_get(self, url):
+        """带超时兜底的页面打开：加载超时就停止加载并继续后续流程"""
+        try:
+            self.driver.get(url)
+        except TimeoutException:
+            print(f"[WARN] 页面加载超时，停止加载继续: {url}")
+            try:
+                self.driver.execute_script("window.stop()")
+            except Exception:
+                pass
 
     def login(self):
         print("[LOGIN] 登录中")
@@ -177,7 +193,7 @@ class HuYaAuto:
             return 0
 
         try:
-            self.driver.get(cfg.URLS["room_base"].format(room_id))
+            self._safe_get(cfg.URLS["room_base"].format(room_id))
             time.sleep(cfg.TIMING["room_enter_wait"])
 
             lp = self.driver.execute_script('return document.body.getAttribute("data-lp")')
@@ -187,7 +203,7 @@ class HuYaAuto:
                 print("[ERROR] 获取房间参数失败")
                 return 0
 
-            self.driver.get(cfg.URLS["gift_tab"].format(lp=lp, gid=gid))
+            self._safe_get(cfg.URLS["gift_tab"].format(lp=lp, gid=gid))
             time.sleep(cfg.TIMING["page_load_wait"])
 
             # 查找虎粮项
