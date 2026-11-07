@@ -22,6 +22,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 import config as cfg
 
 
+class _RendererDead(Exception):
+    """渲染器无响应（Timed out receiving message from renderer），当前浏览器已不可用"""
+
+
 class HuYaAuto:
     """精简稳定版虎牙虎粮自动发放"""
 
@@ -105,6 +109,28 @@ class HuYaAuto:
                 pass
 
     def login(self):
+        # v3（11-07 第 5 次）：cookie 加完后未保护的 refresh 又撞渲染器超时、直接 CRASH。
+        # 渲染器卡死后在同一浏览器上重试无用：撞上就重启整个浏览器重登，最多 3 次。
+        for restart in range(3):
+            try:
+                return self._login_once()
+            except _RendererDead:
+                print(f"[WARN] 渲染器无响应，重启浏览器重登（第 {restart + 1} 次）")
+                if restart == 2:
+                    print("[ERROR] 多次重启浏览器仍无法登录")
+                    return False
+                self._restart_browser()
+        return False
+
+    def _restart_browser(self):
+        try:
+            self.driver.quit()
+        except Exception:
+            pass
+        self.driver = self._init_browser()
+        self.wait = WebDriverWait(self.driver, 5)
+
+    def _login_once(self):
         print("[LOGIN] 登录中")
         # 11-07 定时跑死在这里：driver.get 打开个人中心页时渲染器 28.5 秒无响应
         # （Timed out receiving message from renderer），cookie 还没加就崩了。
@@ -119,8 +145,9 @@ class HuYaAuto:
                 if self.driver.execute_script("return document.readyState") in ("interactive", "complete"):
                     loaded = True
                     break
-            except Exception:
-                pass
+            except Exception as e:
+                if "renderer" in str(e):
+                    raise _RendererDead(str(e))
             print(f"[WARN] 登录页未就绪，第 {attempt + 1} 次重试")
             time.sleep(2)
         if not loaded:
@@ -146,7 +173,16 @@ class HuYaAuto:
                 continue
 
         print(f"[COOKIE] 已添加 {cnt} 个Cookie")
-        self.driver.refresh()
+        try:
+            self.driver.refresh()
+        except Exception as e:
+            if "renderer" in str(e):
+                raise _RendererDead(str(e))
+            print("[WARN] 刷新超时，停止加载继续")
+            try:
+                self.driver.execute_script("window.stop()")
+            except Exception:
+                pass
         time.sleep(cfg.TIMING["page_load_wait"])
 
         try:
@@ -156,7 +192,9 @@ class HuYaAuto:
             username = elem.text.strip()
             print(f"[SUCCESS] 登录成功: {username}")
             return True
-        except Exception:
+        except Exception as e:
+            if "renderer" in str(e):
+                raise _RendererDead(str(e))
             print("[ERROR] 登录失败")
             return False
 
