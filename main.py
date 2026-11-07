@@ -106,7 +106,26 @@ class HuYaAuto:
 
     def login(self):
         print("[LOGIN] 登录中")
-        self.driver.get(cfg.URLS["user_index"])
+        # 11-07 定时跑死在这里：driver.get 打开个人中心页时渲染器 28.5 秒无响应
+        # （Timed out receiving message from renderer），cookie 还没加就崩了。
+        # login 原先没走 _safe_get；改成带重试的 _safe_get，最多 3 次。
+        loaded = False
+        for attempt in range(3):
+            try:
+                self._safe_get(cfg.URLS["user_index"])
+            except Exception as e:
+                print(f"[WARN] 登录页打开异常: {e}")
+            try:
+                if self.driver.execute_script("return document.readyState") in ("interactive", "complete"):
+                    loaded = True
+                    break
+            except Exception:
+                pass
+            print(f"[WARN] 登录页未就绪，第 {attempt + 1} 次重试")
+            time.sleep(2)
+        if not loaded:
+            print("[ERROR] 登录页多次加载失败")
+            return False
         time.sleep(cfg.TIMING["implicit_wait"])
 
         cnt = 0
