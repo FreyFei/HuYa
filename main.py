@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-虎牙虎粮自动发放 - 精简稳定版
+虎牙虎粮自动发放 - v4 加固版
 环境变量配置，核心逻辑极简
+
+v4 改动（针对第 9/10 次失败）：
+- 重启保护扩到每一步：查虎粮、每个房间赠送，撞上渲染器无响应就重启
+  整个浏览器、重新登录后重试一次（v3 只保护了登录）。
+- 背包读到 0 时二次确认：0 可能是背包页没点开导致的误读，再读一次。
+- 不按开播状态跳过房间：离线房间也可以收虎粮，两房始终平分。
 """
 
 import os
@@ -108,6 +114,30 @@ class HuYaAuto:
             except Exception:
                 pass
 
+    @staticmethod
+    def _is_renderer_dead(e):
+        return "renderer" in str(e)
+
+    def _restart_browser(self):
+        try:
+            self.driver.quit()
+        except Exception:
+            pass
+        self.driver = self._init_browser()
+        self.wait = WebDriverWait(self.driver, 5)
+
+    def _with_restart(self, fn, *args, **kwargs):
+        """执行一个阶段；撞上渲染器无响应就重启浏览器、重新登录后重试一次。"""
+        try:
+            return fn(*args, **kwargs)
+        except _RendererDead:
+            print("[WARN] 阶段撞上渲染器无响应，重启浏览器后重试")
+            self._restart_browser()
+            if not self.login():
+                print("[ERROR] 重启后重新登录失败")
+                raise RuntimeError("re-login failed")
+            return fn(*args, **kwargs)
+
     def login(self):
         # v3（11-07 第 5 次）：cookie 加完后未保护的 refresh 又撞渲染器超时、直接 CRASH。
         # 渲染器卡死后在同一浏览器上重试无用：撞上就重启整个浏览器重登，最多 3 次。
@@ -121,14 +151,6 @@ class HuYaAuto:
                     return False
                 self._restart_browser()
         return False
-
-    def _restart_browser(self):
-        try:
-            self.driver.quit()
-        except Exception:
-            pass
-        self.driver = self._init_browser()
-        self.wait = WebDriverWait(self.driver, 5)
 
     def _login_once(self):
         print("[LOGIN] 登录中")
@@ -200,45 +222,57 @@ class HuYaAuto:
 
     def get_hl_count(self):
         print("[SEARCH] 查询虎粮数量")
-        self.driver.get(cfg.URLS["pay_index"])
+        hl = self._count_once()
+        if hl == 0:
+            print("[WARN] 首次读到 0，再确认一次")
+            time.sleep(2)
+            hl = self._count_once()
+        return hl
 
-        # 强制等待页面完全加载（GitHub Action 必须加长）
+    def _count_once(self):
+        # v4：第 10 次死在这里：裸 driver.get 打开背包页时渲染器超时、整个程序崩了。
+        # 改成 _safe_get，撞上渲染器无响应就抛给外层重启浏览器重试。
+        self._safe_get(cfg.URLS["pay_index"])
         time.sleep(3)
 
         try:
-            # 等待并点击【背包】标签（最关键：必须等可点击）
             pack_tab = WebDriverWait(self.driver, 15).until(
                 EC.element_to_be_clickable((By.ID, cfg.PAY_PAGE["pack_tab"]))
             )
             pack_tab.click()
-            time.sleep(1.5)  # 点击后必须等面板渲染
-
-        except Exception:
+            time.sleep(1.5)
+        except Exception as e:
+            if self._is_renderer_dead(e):
+                raise _RendererDead(str(e))
             print("[WARN] 点击背包标签失败")
             return 0
 
-        # 强化版 JS 获取虎粮（容错更强，支持异步加载）
-        n = self.driver.execute_script('''
-            let n = 0;
-            let maxWait = 20;
-            function findHuliang() {
-                const items = document.querySelectorAll('li[data-num]');
-                for (let item of items) {
-                    let title = item.title || item.innerText || '';
-                    if (title.includes('虎粮')) {
-                        return item.getAttribute('data-num');
+        try:
+            n = self.driver.execute_script('''
+                let n = 0;
+                let maxWait = 20;
+                function findHuliang() {
+                    const items = document.querySelectorAll('li[data-num]');
+                    for (let item of items) {
+                        let title = item.title || item.innerText || '';
+                        if (title.includes('虎粮')) {
+                            return item.getAttribute('data-num');
+                        }
                     }
+                    return null;
                 }
-                return null;
-            }
-            // 轮询查找（解决异步加载）
-            while(maxWait-- > 0) {
-                let res = findHuliang();
-                if(res) return res;
-                await new Promise(r => setTimeout(r, 200));
-            }
-            return 0;
-        ''')
+                while(maxWait-- > 0) {
+                    let res = findHuliang();
+                    if(res) return res;
+                    await new Promise(r => setTimeout(r, 200));
+                }
+                return 0;
+            ''')
+        except Exception as e:
+            if self._is_renderer_dead(e):
+                raise _RendererDead(str(e))
+            print("[WARN] 读取虎粮数量失败")
+            return 0
 
         hl = int(n) if n and str(n).isdigit() else 0
         print(f"[COUNT] 虎粮数量: {hl}")
@@ -249,6 +283,22 @@ class HuYaAuto:
         if count <= 0:
             return 0
 
+        try:
+            return self._send_once(room_id, count)
+        except _RendererDead:
+            # v4：单个房间赠送时撞死不连累下一个房间，重启浏览器、重新登录后只重试这一个房间。
+            print(f"[WARN] 房间 {room_id} 赠送时渲染器无响应，重启浏览器重试一次")
+            self._restart_browser()
+            if not self.login():
+                print(f"[ERROR] 重启后重新登录失败，房间 {room_id} 跳过")
+                return 0
+            try:
+                return self._send_once(room_id, count)
+            except _RendererDead:
+                print(f"[WARN] 房间 {room_id} 重试仍撞渲染器，跳过")
+                return 0
+
+    def _send_once(self, room_id, count):
         try:
             self._safe_get(cfg.URLS["room_base"].format(room_id))
             time.sleep(cfg.TIMING["room_enter_wait"])
@@ -308,6 +358,8 @@ class HuYaAuto:
             return count
 
         except Exception as e:
+            if self._is_renderer_dead(e):
+                raise _RendererDead(str(e))
             print(f"[CRASH] 赠送失败: {e}")
             return 0
 
@@ -322,14 +374,14 @@ class HuYaAuto:
             if not self.login():
                 return False
 
-            total = self.get_hl_count()
+            total = self._with_restart(self.get_hl_count)
             if total <= 0:
-                print("❌ 暂无虎粮")
+                print("❌ 暂无虎粮（已二次确认）")
                 return False
 
             print(f"[TOTAL] 虎粮总数: {total}")
 
-            # 分配
+            # 分配：两房平分。没开播的房间也可以收虎粮，不按开播状态跳过或重分。
             n = len(self.rooms)
             per = total // n
             rem = total % n
@@ -358,7 +410,10 @@ class HuYaAuto:
         finally:
             # 必关浏览器，修复进程泄漏
             if hasattr(self, 'driver'):
-                self.driver.quit()
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
                 print("[EXIT] 浏览器已关闭")
 
             return success
