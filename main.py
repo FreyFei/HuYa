@@ -221,13 +221,23 @@ class HuYaAuto:
             return False
 
     def get_hl_count(self):
+        # v4.1：第 11 次两次都因背包页打不开读到 0 就退了。
+        # 区分三种状态：>=0 是读到了（0 还要二次确认），-1 是页没打开、不能下结论。
         print("[SEARCH] 查询虎粮数量")
-        hl = self._count_once()
-        if hl == 0:
-            print("[WARN] 首次读到 0，再确认一次")
-            time.sleep(2)
+        confirmed_zero = False
+        for attempt in range(3):
             hl = self._count_once()
-        return hl
+            if hl >= 0:
+                if hl == 0 and not confirmed_zero:
+                    print("[WARN] 首次读到 0，再确认一次")
+                    confirmed_zero = True
+                    time.sleep(2)
+                    continue
+                return hl
+            print(f"[WARN] 背包页加载失败，第 {attempt + 1} 次重试")
+            time.sleep(3)
+        print("[ERROR] 背包页多次打不开，无法确认虎粮数量")
+        return -1
 
     def _count_once(self):
         # v4：第 10 次死在这里：裸 driver.get 打开背包页时渲染器超时、整个程序崩了。
@@ -236,7 +246,8 @@ class HuYaAuto:
         time.sleep(3)
 
         try:
-            pack_tab = WebDriverWait(self.driver, 15).until(
+            # v4.1：第 11 次背包页加载超时、15 秒等不到标签就判了 0；放宽到 30 秒。
+            pack_tab = WebDriverWait(self.driver, 30).until(
                 EC.element_to_be_clickable((By.ID, cfg.PAY_PAGE["pack_tab"]))
             )
             pack_tab.click()
@@ -244,36 +255,41 @@ class HuYaAuto:
         except Exception as e:
             if self._is_renderer_dead(e):
                 raise _RendererDead(str(e))
-            print("[WARN] 点击背包标签失败")
-            return 0
+            print("[WARN] 背包标签等不到（页可能没加载完）")
+            return -1
 
         try:
+            # v4.1：三态返回值——数字串是读到了，'0' 是面板已加载但确实没虎粮，
+            # null 是面板根本没加载出礼物项（不能判 0）。
             n = self.driver.execute_script('''
-                let n = 0;
                 let maxWait = 20;
                 function findHuliang() {
                     const items = document.querySelectorAll('li[data-num]');
+                    if (items.length === 0) return null;
                     for (let item of items) {
                         let title = item.title || item.innerText || '';
                         if (title.includes('虎粮')) {
                             return item.getAttribute('data-num');
                         }
                     }
-                    return null;
+                    return '0';
                 }
                 while(maxWait-- > 0) {
                     let res = findHuliang();
-                    if(res) return res;
+                    if(res !== null) return res;
                     await new Promise(r => setTimeout(r, 200));
                 }
-                return 0;
+                return null;
             ''')
         except Exception as e:
             if self._is_renderer_dead(e):
                 raise _RendererDead(str(e))
             print("[WARN] 读取虎粮数量失败")
-            return 0
+            return -1
 
+        if n is None:
+            print("[WARN] 背包面板未加载出礼物项")
+            return -1
         hl = int(n) if n and str(n).isdigit() else 0
         print(f"[COUNT] 虎粮数量: {hl}")
         return hl
@@ -375,6 +391,9 @@ class HuYaAuto:
                 return False
 
             total = self._with_restart(self.get_hl_count)
+            if total < 0:
+                print("❌ 背包页打不开，无法确认虎粮数量")
+                return False
             if total <= 0:
                 print("❌ 暂无虎粮（已二次确认）")
                 return False
