@@ -62,6 +62,9 @@ class HuYaAuto:
 
         self.driver = self._init_browser()
         self.wait = WebDriverWait(self.driver, 5)
+        # v4.2：礼物页各步等 15 秒。11-05 就怀疑过 798 的空 Message 是 5 秒等不到礼物面板；
+        # #2/#6/#7/#12 四次 798 都是同一个空报错、1995 都成功，5 秒很可能就是病根。
+        self.gift_wait = WebDriverWait(self.driver, 15)
 
     def _parse_rooms(self, rooms_str):
         rooms = []
@@ -125,6 +128,7 @@ class HuYaAuto:
             pass
         self.driver = self._init_browser()
         self.wait = WebDriverWait(self.driver, 5)
+        self.gift_wait = WebDriverWait(self.driver, 15)
 
     def _with_restart(self, fn, *args, **kwargs):
         """执行一个阶段；撞上渲染器无响应就重启浏览器、重新登录后重试一次。"""
@@ -315,10 +319,12 @@ class HuYaAuto:
                 return 0
 
     def _send_once(self, room_id, count):
+        step = "进房间"
         try:
             self._safe_get(cfg.URLS["room_base"].format(room_id))
             time.sleep(cfg.TIMING["room_enter_wait"])
 
+            step = "取房间参数"
             lp = self.driver.execute_script('return document.body.getAttribute("data-lp")')
             gid = self.driver.execute_script('return document.body.getAttribute("data-gid")')
 
@@ -326,11 +332,13 @@ class HuYaAuto:
                 print("[ERROR] 获取房间参数失败")
                 return 0
 
+            step = "进礼物页"
             self._safe_get(cfg.URLS["gift_tab"].format(lp=lp, gid=gid))
             time.sleep(cfg.TIMING["page_load_wait"])
 
             # 查找虎粮项
-            items = self.wait.until(
+            step = "找礼物项"
+            items = self.gift_wait.until(
                 EC.presence_of_all_elements_located((By.CLASS_NAME, cfg.GIFT["item_class"]))
             )
             hu_liang = None
@@ -350,7 +358,8 @@ class HuYaAuto:
             time.sleep(1)
 
             # 自定义数量
-            inp = self.wait.until(
+            step = "填数量"
+            inp = self.gift_wait.until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, cfg.GIFT["input_css"]))
             )
             inp.click()
@@ -358,13 +367,15 @@ class HuYaAuto:
             inp.send_keys(str(count))
 
             # 赠送
-            send_btn = self.wait.until(
+            step = "点赠送"
+            send_btn = self.gift_wait.until(
                 EC.element_to_be_clickable((By.CLASS_NAME, cfg.GIFT["send_class"]))
             )
             send_btn.click()
             time.sleep(1)
 
-            confirm_btn = self.wait.until(
+            step = "点确认"
+            confirm_btn = self.gift_wait.until(
                 EC.element_to_be_clickable((By.CLASS_NAME, cfg.GIFT["confirm_class"]))
             )
             confirm_btn.click()
@@ -376,7 +387,8 @@ class HuYaAuto:
         except Exception as e:
             if self._is_renderer_dead(e):
                 raise _RendererDead(str(e))
-            print(f"[CRASH] 赠送失败: {e}")
+            # v4.2：空 Message 的报错以前不知道死在哪一步，现在把步骤名打出来。
+            print(f"[CRASH] 赠送失败（{step}）: {e}")
             return 0
 
     def run(self):
